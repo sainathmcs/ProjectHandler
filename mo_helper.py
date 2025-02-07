@@ -8,7 +8,7 @@ and move. Before performing any operation, it validates the current YAML and fol
 structure by building a doubly linked list of task groups. Folders not matching our naming
 scheme are ignored.
 
-File creation and folder creation are “safe” – if a file/folder exists, you will be asked
+File creation and folder creation are "safe" – if a file/folder exists, you will be asked
 whether to overwrite it (default: no). In that case, the existing file/folder is backed up
 to a temporary location (and the backup location is printed).
 
@@ -72,32 +72,30 @@ if __name__ == '__main__':
     main()
 '''
 DEFAULT_BUILD_SH_TEMPLATE = """#!/usr/bin/env bash
-if [ "$#" -ne 1 ]; then
-    echo "Usage: $0 <path_to_venv>"
-    exit 1
-fi
 
-VENV_PATH="$1"
+# Create temporary directory for virtual environment
+VENV_TMP_DIR=$(mktemp -d)
+echo "Creating virtual environment in temporary directory: $VENV_TMP_DIR"
+python3 -m venv "$VENV_TMP_DIR/venv"
+source "$VENV_TMP_DIR/venv/bin/activate"
 
-if [ ! -d "$VENV_PATH" ]; then
-    echo "Creating virtual environment at $VENV_PATH..."
-    python3 -m venv "$VENV_PATH"
-fi
+# Create temporary directory for uv installation
+UV_TMP_DIR=$(mktemp -d)
+echo "Installing uv in temporary directory: $UV_TMP_DIR"
+pip install --target="$UV_TMP_DIR" uv
+export PYTHONPATH="$UV_TMP_DIR:$PYTHONPATH"
 
-source "$VENV_PATH/bin/activate"
+# Install requirements using uv
+echo "Installing requirements using uv..."
+uv pip install -r requirements.txt
+
 echo "Building the project..."
-# Add build steps here, e.g., install dependencies, run tests, etc.
-deactivate
-"""
-DEFAULT_TOX_CONFIG = """[tox]
-envlist = py312
+# Add build steps here
 
-[testenv]
-basepython = python3.12
-deps =
-    uv
-commands =
-    uv
+# Cleanup
+deactivate
+rm -rf "$VENV_TMP_DIR"
+rm -rf "$UV_TMP_DIR"
 """
 
 def get_requirements_template():
@@ -114,9 +112,6 @@ def get_task_template(task_name):
 
 def get_build_sh_template():
     return load_template("build.sh", DEFAULT_BUILD_SH_TEMPLATE)
-
-def get_tox_config_template():
-    return load_template("tox.ini", DEFAULT_TOX_CONFIG)
 
 # =============================
 # Backup, Rename, and Safe Write Helpers
@@ -544,7 +539,6 @@ def move_task(base_dir, from_pos_str, to_pos_str):
 
 # =============================
 # CLI Commands using Click
-# (Note: the convert operation has been removed.)
 # =============================
 
 @click.group()
@@ -564,7 +558,6 @@ def init(model):
     safe_create_directory(os.path.join(base_dir, "tests"))
     safe_create_directory(os.path.join(base_dir, "utils"))
     safe_write_file(os.path.join(base_dir, "config", ".env"), "# environment variables go here\n")
-    safe_write_file(os.path.join(base_dir, "tox.ini"), get_tox_config_template())
     safe_write_file(os.path.join(base_dir, "requirements.txt"), get_requirements_template())
     # Create build.sh and set executable permissions
     build_sh_path = os.path.join(base_dir, "build.sh")
