@@ -71,6 +71,7 @@ def main():
 if __name__ == '__main__':
     main()
 '''
+# Updated build.sh template: note the BEGIN/END PYINSTALLER markers.
 DEFAULT_BUILD_SH_TEMPLATE = """#!/usr/bin/env bash
 
 # Create temporary directory for virtual environment
@@ -90,7 +91,9 @@ echo "Installing requirements using uv..."
 uv pip install -r requirements.txt
 
 echo "Building the project..."
-# Add build steps here
+# BEGIN PYINSTALLER
+# (pyinstaller commands will be inserted here)
+# END PYINSTALLER
 
 # Cleanup
 deactivate
@@ -323,16 +326,116 @@ def parse_position(pos_str):
     return digits, letters if letters else None
 
 # =============================
+# New Helpers for PyInstaller and Test Scripts
+# =============================
+
+def generate_pyinstaller_commands(base_dir="."):
+    """
+    Generate pyinstaller commands (one per task) using temporary work directories and placing
+    executables in the dist folder.
+    """
+    try:
+        task_groups, _ = build_task_groups(base_dir)
+    except Exception as e:
+        click.echo(f"Error generating pyinstaller commands: {e}")
+        return ""
+    commands = []
+    for group in task_groups:
+        for task in group.tasks:
+            # Note: using $(mktemp -d) inline so that each command creates its own temp directory.
+            cmd = f'echo "Building executable for task {task.full_position()} - {task.task_name}"\n'
+            cmd += f'pyinstaller --onefile --workpath=$(mktemp -d) --distpath=$(pwd)/dist "$(pwd)/{task.folder}/{task.task_name}.py"\n'
+            commands.append(cmd)
+    return "\n".join(commands)
+
+def update_build_sh(base_dir="."):
+    """
+    Update the build.sh file by replacing the text between the markers with the latest pyinstaller commands.
+    """
+    build_sh_path = os.path.join(base_dir, "build.sh")
+    if not os.path.exists(build_sh_path):
+        click.echo("build.sh not found, skipping update of pyinstaller commands.")
+        return
+    with open(build_sh_path, "r") as f:
+        content = f.read()
+    pattern = re.compile(r'(# BEGIN PYINSTALLER\n)(.*?)(# END PYINSTALLER)', re.DOTALL)
+    new_commands = generate_pyinstaller_commands(base_dir)
+    new_block = f"# BEGIN PYINSTALLER\n{new_commands}\n# END PYINSTALLER"
+    if pattern.search(content):
+        new_content = pattern.sub(new_block, content)
+    else:
+        # If markers not found, append at the end.
+        new_content = content.rstrip() + "\n\n" + new_block + "\n"
+    with open(build_sh_path, "w") as f:
+        f.write(new_content)
+    click.echo("Updated build.sh with latest pyinstaller commands.")
+
+def generate_test_script_content(task, base_dir="."):
+    """
+    Generate a simple test script for the given task.
+    The test script calls the task's main python file.
+    """
+    return f'''#!/usr/bin/env python3
+"""
+Auto-generated test script for task: {task.task_name} (position {task.full_position()})
+"""
+import subprocess
+import sys
+
+def test_task():
+    result = subprocess.run(["python3", "../{task.folder}/{task.task_name}.py"], capture_output=True, text=True)
+    print(result.stdout)
+    if result.returncode != 0:
+        sys.exit(result.returncode)
+
+if __name__ == '__main__':
+    test_task()
+'''
+
+def update_test_scripts(base_dir="."):
+    """
+    Update (or create) test scripts in the tests directory for each current task.
+    Also remove outdated test scripts.
+    """
+    tests_dir = os.path.join(base_dir, "tests")
+    if not os.path.exists(tests_dir):
+        click.echo("tests directory not found, skipping test scripts update.")
+        return
+    try:
+        task_groups, _ = build_task_groups(base_dir)
+    except Exception as e:
+        click.echo(f"Error updating test scripts: {e}")
+        return
+    current_test_files = set()
+    for group in task_groups:
+        for task in group.tasks:
+            test_filename = f"test_{task.task_name}.py"
+            test_file_path = os.path.join(tests_dir, test_filename)
+            content = generate_test_script_content(task, base_dir)
+            with open(test_file_path, "w") as f:
+                f.write(content)
+            current_test_files.add(test_filename)
+            click.echo(f"Updated test script for task {task.full_position()}: {test_filename}")
+    # Remove outdated test scripts.
+    for f_name in os.listdir(tests_dir):
+        if f_name.startswith("test_") and f_name.endswith(".py") and f_name not in current_test_files:
+            full_path = os.path.join(tests_dir, f_name)
+            click.echo(f"Removing outdated test script: {full_path}")
+            os.remove(full_path)
+
+# =============================
 # Core Operations: add, delete, and move
-# (The convert operation has been removed.)
 # =============================
 
 def add_task(base_dir, pos_str, task_name):
     """
-    Add a new task.
+    Add a new task to the project.
       - For sequential tasks (no letter), if the target group exists then shift groups.
       - For parallel tasks (letter provided), if the group at pos is serial then convert it.
     Creates a new folder and writes template files.
+    Also updates build.sh (pyinstaller commands) and creates a test script.
+    
+    Note: The pyinstaller command is no longer executed immediately.
     """
     # Try to load existing Mo.yaml, if not found create a new one
     yaml_path = os.path.join(base_dir, "Mo.yaml")
@@ -345,9 +448,10 @@ def add_task(base_dir, pos_str, task_name):
     task_groups, _ = build_task_groups(base_dir)
     current_group_count = len(task_groups)
     pos, letter = parse_position(pos_str)
+    tasks_yaml = mo.get("tasks", {})
+
     if int(pos) > current_group_count + 1:
         raise ValueError(f"Position cannot be more than {current_group_count + 1} (got {pos}).")
-    tasks_yaml = mo.get("tasks", {})
 
     if letter is None:
         if pos not in tasks_yaml:
@@ -366,7 +470,6 @@ def add_task(base_dir, pos_str, task_name):
                 tasks_yaml[pos][letter] = task_name
             else:
                 existing_task = tasks_yaml[pos]
-                # Convert existing sequential task to parallel 'b' position
                 old_folder = os.path.join(base_dir, f"{pos}_{existing_task}")
                 new_folder = os.path.join(base_dir, f"{pos}b_{existing_task}")
                 if os.path.exists(old_folder):
@@ -377,7 +480,6 @@ def add_task(base_dir, pos_str, task_name):
                         click.echo(f"Converted sequential task at position {pos} to parallel.")
                     else:
                         raise ValueError("Cannot add parallel task without converting existing serial task.")
-                # Place existing task at 'b' and new task at requested position
                 tasks_yaml[pos] = {"b": existing_task, letter: task_name}
 
     # First create the task folder and its contents
@@ -403,11 +505,19 @@ def add_task(base_dir, pos_str, task_name):
         yaml.dump(mo, f)
     click.echo(f"Added task '{task_name}' at position '{pos_str}'. Created folder '{task_folder}'.")
 
+    # Do not execute pyinstaller immediately.
+    click.echo("Skipping immediate execution of pyinstaller. The build.sh file has been updated with the pyinstaller commands.")
+
+    # Update build.sh (pyinstaller commands) and test scripts
+    update_build_sh(base_dir)
+    update_test_scripts(base_dir)
+
 def delete_task(base_dir, pos_str):
     """
     Delete a task.
     Supply the full position (e.g. "3" for a serial task or "3b" for a parallel task).
     After deletion, later groups are shifted upward.
+    Also updates build.sh and test scripts.
     """
     task_groups, mo = build_task_groups(base_dir)
     tasks_yaml = mo.get("tasks", {})
@@ -454,6 +564,8 @@ def delete_task(base_dir, pos_str):
         click.echo(f"Deleted parallel task at position {pos}{letter}.")
     mo["tasks"] = tasks_yaml
     save_yaml(mo, base_dir)
+    update_build_sh(base_dir)
+    update_test_scripts(base_dir)
 
 def move_task(base_dir, from_pos_str, to_pos_str):
     """
@@ -462,6 +574,7 @@ def move_task(base_dir, from_pos_str, to_pos_str):
     The task is removed from its original position (shifting groups upward if needed)
     and reinserted at the destination (shifting groups downward if needed).
     Works for both serial and parallel tasks.
+    Also updates build.sh and test scripts.
     """
     # First, remove the source task from its position.
     task_groups, mo = build_task_groups(base_dir)
@@ -536,6 +649,8 @@ def move_task(base_dir, from_pos_str, to_pos_str):
     click.echo(f"Moved task '{task_name}' from {from_pos_str} to {to_pos_str}.")
     mo["tasks"] = tasks_yaml
     save_yaml(mo, base_dir)
+    update_build_sh(base_dir)
+    update_test_scripts(base_dir)
 
 # =============================
 # CLI Commands using Click
@@ -557,6 +672,7 @@ def init(model):
     safe_create_directory(os.path.join(base_dir, "config"))
     safe_create_directory(os.path.join(base_dir, "tests"))
     safe_create_directory(os.path.join(base_dir, "utils"))
+    safe_create_directory(os.path.join(base_dir, "dist"))  # New dist directory
     safe_write_file(os.path.join(base_dir, "config", ".env"), "# environment variables go here\n")
     safe_write_file(os.path.join(base_dir, "requirements.txt"), get_requirements_template())
     # Create build.sh and set executable permissions
