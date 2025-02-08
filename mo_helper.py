@@ -6,10 +6,9 @@ This CLI tool initializes and maintains a model task project with a defined fold
 structure and a YAML mapping (Mo.yaml). It supports operations such as init, add,
 delete, move, validate, and wrapper update.
 
-The wrapper update functionality parses the task source code to detect usage of
-sys.argv[...] in assignments and then generates a wrapper that explicitly assigns
-each expected command‐line parameter to a variable (e.g. a = sys.argv[1]) in the
-same order as used in the task code.
+The wrapper update functionality parses the task source code to detect sys.argv
+assignments and then generates a wrapper that explicitly assigns each expected
+command-line parameter to a variable (e.g. a = sys.argv[1]) in the same order.
 """
 
 import os
@@ -25,7 +24,7 @@ import ast
 # Default Template Constants
 # =============================================================================
 
-DEFAULT_REQ_TEMPLATE = "pyinstaller\n"
+DEFAULT_REQ_TEMPLATE = "pyinstaller\ncoverage\npytest\n"
 
 DEFAULT_WRAPPER_TEMPLATE = '''#!/usr/bin/env python3
 """
@@ -151,7 +150,7 @@ def backup_path(path):
     return backup_dir
 
 def safe_write_file(file_path, content):
-    # Write content safely to file_path, backing up if the file exists.
+    # Write content safely to file_path, backing up any existing file.
     if os.path.exists(file_path):
         overwrite = click.confirm(f"File '{file_path}' exists. Overwrite?", default=False)
         if not overwrite:
@@ -165,7 +164,7 @@ def safe_write_file(file_path, content):
     click.echo(f"Wrote file '{file_path}'.")
 
 def safe_create_directory(dir_path):
-    # Create a directory; if it exists, ask to overwrite.
+    # Create a directory; if it exists, ask whether to overwrite it.
     if os.path.exists(dir_path):
         overwrite = click.confirm(f"Directory '{dir_path}' exists. Overwrite?", default=False)
         if not overwrite:
@@ -179,9 +178,20 @@ def safe_create_directory(dir_path):
     click.echo(f"Created directory '{dir_path}'.")
 
 def rename_path(src, dst, base_dir="."):
-    # Rename a file or folder using git mv.
-    subprocess.run(["git", "mv", src, dst], cwd=base_dir, check=True)
-    click.echo(f"Renamed '{src}' to '{dst}' using git mv.")
+    # Normalize the paths using os.path.normpath for Windows compatibility.
+    src_norm = os.path.normpath(src)
+    dst_norm = os.path.normpath(dst)
+    try:
+        # Try to use git mv first.
+        subprocess.run(["git", "mv", src_norm, dst_norm], cwd=base_dir, check=True)
+        click.echo(f"Renamed '{src_norm}' to '{dst_norm}' using git mv.")
+    except Exception as e:
+        click.echo(f"git mv failed: {e}. Falling back to os.rename.")
+        try:
+            os.rename(src_norm, dst_norm)
+            click.echo(f"Renamed '{src_norm}' to '{dst_norm}' using os.rename.")
+        except Exception as e2:
+            click.echo(f"Error renaming '{src_norm}' to '{dst_norm}' using os.rename: {e2}")
 
 # =============================================================================
 # Data Structures: Task and TaskGroup
@@ -394,6 +404,18 @@ def add_task(base_dir, pos_str, task_name):
             mo = yaml.safe_load(f)
     else:
         raise FileNotFoundError("Mo.yaml not found. Please initialize the project first.")
+    
+    # Check if task name already exists
+    tasks_yaml = mo.get("tasks", {})
+    for pos, task_value in tasks_yaml.items():
+        if isinstance(task_value, dict):
+            # Check parallel tasks
+            if task_name in task_value.values():
+                raise ValueError(f"Task with name '{task_name}' already exists in parallel group at position {pos}")
+        else:
+            # Check sequential task
+            if task_value == task_name:
+                raise ValueError(f"Task with name '{task_name}' already exists at position {pos}")
     task_groups, _ = build_task_groups(base_dir)
     current_group_count = len(task_groups)
     pos, letter = parse_position(pos_str)
@@ -607,8 +629,8 @@ class SysArgVisitor(ast.NodeVisitor):
 def update_wrapper(base_dir, task):
     """
     Update the wrapper for the given task by parsing the task code to extract
-    sys.argv indices and generating assignments for each expected parameter.
-    The generated wrapper explicitly assigns each CLI argument to a variable.
+    sys.argv indices and generating explicit assignments for each expected parameter.
+    The generated wrapper assigns each CLI argument to a variable (e.g. a = sys.argv[1]).
     """
     task_file = os.path.join(base_dir, task.folder, f"{task.task_name}.py")
     try:
@@ -632,11 +654,11 @@ def update_wrapper(base_dir, task):
             expected_params.append(params.get(i, f"param{i}"))
 
     usage_str = " ".join(expected_params)
-    # Generate explicit assignment lines for each parameter.
+    # Generate explicit assignment lines.
     assignment_lines = ""
     for i, var in enumerate(expected_params):
         assignment_lines += f"    {var} = sys.argv[{i+1}]\n"
-    # Generate the argument list for subprocess.run using the variable names.
+    # Create an argument list for subprocess.run using the variable names.
     arg_list = ", ".join(expected_params)
 
     new_wrapper_content = f'''#!/usr/bin/env python3
